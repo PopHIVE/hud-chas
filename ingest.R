@@ -13,6 +13,13 @@
 # and gave values ~2x too high before catching the mismatch. Verified:
 # (T2_est3 + T2_est76) / T2_est1 is an exact match against CHR&R's
 # chr_severe_housing_problems.
+#
+# State-level rows come from the same zip's "-040-" file (040 = Census
+# summary level for state, vs 050 for state+county) -- a real, independently
+# published HUD tabulation, not an aggregate computed here. Confirmed live:
+# 52 rows (50 states + DC + Puerto Rico), same geoid/table structure and
+# same formula as county. No "-010-"/"-020-"/"-030-" (nation/region/
+# division) file exists for CHAS, so there's no national rate to add.
 # =============================================================================
 
 library(dplyr)
@@ -27,8 +34,8 @@ ua      <- httr::user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebK
 
 invisible(httr::GET(paste0(CHAS_BASE, ".html"), handle = session, ua))
 
-window_url <- function(start_year) {
-  sprintf("%s/%dthru%d-050-csv.zip", CHAS_BASE, start_year, start_year + 4L)
+window_url <- function(start_year, level = "050") {
+  sprintf("%s/%dthru%d-%s-csv.zip", CHAS_BASE, start_year, start_year + 4L, level)
 }
 
 latest_start <- tryCatch({
@@ -80,8 +87,37 @@ if (!is.na(latest_start)) {
 
       vroom::vroom_write(result, "standard/data_county.csv.gz", delim = ",")
 
+      state_zip <- "raw/chas_state.zip"
+      state_tmp <- paste0(state_zip, ".tmp")
+      Sys.sleep(1)
+      state_resp <- httr::GET(
+        window_url(latest_start, level = "040"), handle = session, ua,
+        httr::write_disk(state_tmp, overwrite = TRUE)
+      )
+
+      if (httr::status_code(state_resp) == 200) {
+        file.rename(state_tmp, state_zip)
+        unzip(state_zip, files = "040/Table2.csv", exdir = extract_dir, overwrite = TRUE)
+
+        t2_state <- vroom::vroom(file.path(extract_dir, "040", "Table2.csv"), show_col_types = FALSE)
+
+        state_result <- t2_state %>%
+          transmute(
+            geography                       = sub("^0400000US", "", geoid),
+            time                            = paste0(end_year, "-12-31"),
+            hud_pct_severe_housing_problems = (T2_est3 + T2_est76) / T2_est1
+          ) %>%
+          filter(!is.na(geography), nchar(geography) == 2)
+
+        vroom::vroom_write(state_result, "standard/data_state.csv.gz", delim = ",")
+        message("HUD CHAS data written: ", nrow(result), " counties, ", nrow(state_result), " states")
+      } else {
+        message("[WARN] HUD CHAS state-level download failed (status ", httr::status_code(state_resp), ")")
+        unlink(state_tmp)
+        message("HUD CHAS data written: ", nrow(result), " counties (state-level fetch failed)")
+      }
+
       jsonlite::write_json(list(chas_end_year = end_year), "process.json", auto_unbox = TRUE)
-      message("HUD CHAS data written: ", nrow(result), " counties")
     } else {
       message("[WARN] HUD CHAS download failed (status ", httr::status_code(resp), ")")
       unlink(tmp)
